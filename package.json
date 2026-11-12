@@ -1,0 +1,20 @@
+{
+  "name": "workers-sdk-15089-repro",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node repro.ts",
+    "typecheck": "tsc",
+    "main": "node repro.ts main",
+    "pr": "node repro.ts pr"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.0",
+    "wrangler-main": "https://pkg.pr.new/wrangler@main",
+    "wrangler-pr": "https://pkg.pr.new/wrangler@16874"
+  }
+}
