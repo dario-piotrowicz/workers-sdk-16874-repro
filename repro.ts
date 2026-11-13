@@ -1,246 +1,264 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname } from "node:path";
-import { compileFunction } from "node:vm";
+import { fork, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
+import { REUSE_WINDOW_MS, startProvider, type Provider } from "./provider.ts";
+import {
+  configureEnvironment,
+  loadWrangler,
+  runAuthClient,
+  type AuthResult,
+  type AuthStorage,
+  type Build,
+  type ClientOptions,
+  type ClientEvent,
+  type Pause,
+} from "./wrangler.ts";
 
-/** The two installed package aliases compared by the reproduction. */
-type Build = "main" | "pr";
+/** Independent schedules: an ordinary collision, the PR's race, its control, and a longer suspension. */
+type Scenario = "overlap" | "stale-expiry" | "control" | "long-suspension";
 
-/** The OAuth credential fields read and written by Wrangler's auth flow. */
-type Credentials = {
-  oauth_token: string;
-  refresh_token: string;
-  expiration_time: string;
+/** A real child process and the checkpoints, writes, and result it reports over IPC. */
+type Client = {
+  process: ChildProcess;
+  options: ClientOptions;
+  events: ClientEvent[];
+  diagnostics: string;
+  error?: Error;
 };
 
-/** The storage interface injected into the real OAuth implementation. */
-type AuthStorage = {
-  read(): Credentials;
-  write(credentials: Credentials): void;
-  clear(): never;
-  path(): string;
-};
+/** Start a named client within a scenario, optionally suspending it at selected auth boundaries. */
+type LaunchClient = (id: string, pauses?: Pause[]) => Client;
 
-/** The private bundle internals needed to run auth and replace its HTTP client. */
-type AuthBundle = {
-  createOAuthFlow(context: unknown): {
-    getOAuthTokenFromLocalState(): Promise<string | undefined>;
-  };
-  undici: { fetch: typeof fetch };
-};
-
-/** C's initial activity and the subsequent refresh outcome for one replay. */
-type ReplayResult = {
-  firstExchanges: string[];
-  firstWrites: number;
-  laterAccessToken: string | undefined;
-  exchanges: string[];
-};
-
-const EXPIRED_TIME = "2000-01-01T00:00:00.000Z";
-const SIBLING_CREDENTIALS: Credentials = {
-  oauth_token: "access-T1",
-  refresh_token: "T1",
-  expiration_time: "2099-01-01T00:00:00.000Z",
-};
-
-/**
- * Isolate Wrangler's startup configuration before loading either bundle.
- * Auth requests are mocked, metrics are disabled, and home/config lookups stay
- * inside this project. These changes affect this process, not the user's shell.
- */
-function configureEnvironment(): void {
-  process.env.WRANGLER_AUTH_DOMAIN = "repro.invalid";
-  process.env.WRANGLER_TOKEN_URL = "https://repro.invalid/oauth2/token";
-  process.env.WRANGLER_SEND_METRICS = "false";
-  process.env.HOME = import.meta.dirname;
-  process.env.USERPROFILE = import.meta.dirname;
-  process.env.XDG_CONFIG_HOME = import.meta.dirname;
-}
-
-/**
- * Load the actual published Wrangler bundle with Node's CommonJS wrapper
- * arguments. An extra return statement exposes its unexported OAuth factory
- * and Undici client without editing installed files or changing auth logic.
- */
-function loadAuth(packageName: string): AuthBundle {
-  const filename = createRequire(import.meta.url).resolve(packageName);
-  const source = readFileSync(filename, "utf8");
-  const module = { exports: {} };
-  return compileFunction(
-    `${source}\nreturn { createOAuthFlow, undici: require_undici() };`,
-    ["require", "module", "exports", "__filename", "__dirname"],
-    { filename },
-  )(createRequire(filename), module, module.exports, filename, dirname(filename));
-}
-
-/**
- * Model shared credential storage using independent in-memory snapshots.
- * C initially sees expired T0. B's valid T1 credentials appear on the second
- * read, precisely between C's expiry decision and its refresh-time reread.
- */
-function createMockStorage() {
-  const state = {
-    credentials: {
-      oauth_token: "access-T0",
-      refresh_token: "T0",
-      expiration_time: EXPIRED_TIME,
-    },
-    writes: 0,
-  };
-  let reads = 0;
-  const storage: AuthStorage = {
-    /** Inject B's save at the race boundary, then return a fresh snapshot. */
-    read() {
-      if (++reads === 2) state.credentials = { ...SIBLING_CREDENTIALS };
-      return { ...state.credentials };
-    },
-    /** Record writes requested by Wrangler; never touch a credential file. */
-    write(credentials) {
-      state.writes++;
-      state.credentials = { ...credentials };
-    },
-    /** Fail if the tested flow unexpectedly tries to delete credentials. */
-    clear() {
-      throw new Error("Unexpected credential deletion");
-    },
-    /** Supply a diagnostic placeholder instead of a real credential path. */
-    path() {
-      return "<fake credentials; no file>";
-    },
-  };
-  return { storage, state };
-}
-
-/**
- * Model a provider that has already issued T1 to A and B. Each successful
- * refresh consumes the current token and issues the next generation. Rejecting
- * a consumed token models a later attempt after reuse tolerance has elapsed;
- * neither the live provider nor the duration of that window is tested here.
- */
-function createMockProvider() {
-  let currentRefreshToken = "T1";
-  let nextGeneration = 2;
-  const exchanges: string[] = [];
-
-  /** Handle the Access probe and token exchanges without a network fallback. */
-  const fetchMock: typeof fetch = async (url, options) => {
-    if (String(url) === "https://repro.invalid/") return new Response("");
-    assert.equal(String(url), "https://repro.invalid/oauth2/token");
-    const params = new URLSearchParams(String(options?.body));
-    assert.equal(params.get("grant_type"), "refresh_token");
-    const token = params.get("refresh_token");
-    if (token !== currentRefreshToken) {
-      exchanges.push(`${token} -> invalid_grant`);
-      return Response.json({ error: "invalid_grant" }, { status: 400 });
-    }
-    currentRefreshToken = `T${nextGeneration++}`;
-    exchanges.push(`${token} -> ${currentRefreshToken}`);
-    return Response.json({
-      access_token: `access-${currentRefreshToken}`,
-      refresh_token: currentRefreshToken,
-      expires_in: 3600,
-      scope: "account:read",
-    });
-  };
-  return { fetch: fetchMock, exchanges };
-}
-
-/**
- * Connect the real OAuth implementation to fake storage and HTTP. Wrangler uses
- * its bundled Undici client, so replacing global fetch alone would not work.
- * The injected context prevents interactive login or environment credentials.
- */
-function createFlow(bundle: AuthBundle, storage: AuthStorage, fetchMock: typeof fetch) {
-  bundle.undici.fetch = fetchMock;
-  /** Discard auth diagnostics so the replay's own output remains readable. */
-  const ignore = () => {};
-  return bundle.createOAuthFlow({
-    logger: { debug: ignore, info: ignore, log: ignore, warn: ignore, error: ignore },
-    clientId: "repro",
-    redirectUri: "http://localhost:8976/oauth/callback",
-    consent: { granted: { url: "" }, denied: { url: "", error: "denied" } },
-    cliDisplayName: "Repro",
-    deviceLoginCommand: "unused",
-    /** Prevent the flow from bypassing the fake OAuth credentials. */
-    hasEnvCredentials: () => false,
-    /** Keep authentication on its non-interactive path. */
-    isNonInteractiveOrCI: () => true,
-    /** Fail rather than open a browser if an interactive path is reached. */
-    openInBrowser: async () => {
-      throw new Error("Unexpected interactive login");
-    },
-    allowGlobalAuthKey: false,
-    temporary: undefined,
-    /** Reuse the same mock store across all reads and writes in this replay. */
-    storageFactory: () => storage,
+/** Start an isolated Node process; all clients in a scenario share one real TOML file. */
+function startClient(options: ClientOptions, clients: Client[]): Client {
+  const child = fork(fileURLToPath(import.meta.url), ["--client"], {
+    cwd: options.directory,
+    env: { REPRO_CLIENT: JSON.stringify(options) },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
+  const client: Client = { process: child, options, events: [], diagnostics: "" };
+
+  /** Retain messages even when a checkpoint happens before its parent starts waiting. */
+  function onMessage(event: ClientEvent): void {
+    client.events.push(event);
+  }
+
+  /** Preserve child diagnostics for a useful failure message without cluttering successful output. */
+  function onOutput(chunk: Buffer): void {
+    client.diagnostics += chunk.toString();
+  }
+
+  /** Surface spawn failures in the same bounded checkpoint wait as other child failures. */
+  function onError(error: Error): void {
+    client.error = error;
+  }
+
+  child.on("message", onMessage);
+  child.on("error", onError);
+  child.stdout!.on("data", onOutput);
+  child.stderr!.on("data", onOutput);
+  clients.push(client);
+  return client;
+}
+
+/** Wait for an actual client checkpoint or outcome, failing on crashes or stalled schedules. */
+async function waitFor(client: Client, event: Pause | "done"): Promise<ClientEvent> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    for (const message of client.events) {
+      if (message.event === event) return message;
+    }
+    assert.ifError(client.error);
+    assert.ok(
+      client.process.exitCode === null && client.process.signalCode === null,
+      `${client.options.id} exited before ${event}: ${client.diagnostics}`,
+    );
+    await delay(10);
+  }
+  throw new Error(`${client.options.id} timed out waiting for ${event}: ${client.diagnostics}`);
+}
+
+/** Resume a suspended client without changing any credentials or HTTP responses. */
+function resume(client: Client, point: Pause): void {
+  writeFileSync(join(client.options.directory, `${client.options.id}.${point}.resume`), "");
+}
+
+/** Obtain the real non-interactive auth result returned by a fresh Wrangler process. */
+async function finish(client: Client): Promise<AuthResult> {
+  const message = await waitFor(client, "done");
+  assert.ok(message.result);
+  if (client.process.exitCode === null && client.process.signalCode === null) {
+    await once(client.process, "exit", { signal: AbortSignal.timeout(5_000) });
+  }
+  assert.equal(client.process.exitCode, 0, client.diagnostics);
+  return message.result;
+}
+
+/** Let real time expire the access token and the local provider's reuse window; never edit the token file. */
+async function waitForExpiry(storage: AuthStorage, provider: Provider): Promise<void> {
+  const credentials = storage.read();
+  assert.ok(credentials);
+  const readyAt = Math.max(
+    Date.parse(credentials.expiration_time),
+    provider.state.lastRotation + REUSE_WINDOW_MS,
+  );
+  assert.ok(Number.isFinite(readyAt), "Expected a valid access-token expiry on disk");
+  await delay(Math.max(0, readyAt - Date.now()) + 100);
+}
+
+/** Stop only this reproduction's children, including clients still held at a checkpoint after an error. */
+async function stopClients(clients: Client[]): Promise<void> {
+  for (const client of clients) {
+    if (client.process.exitCode === null && client.process.signalCode === null) {
+      client.process.kill();
+    }
+  }
+  for (const client of clients) {
+    if (client.process.exitCode === null && client.process.signalCode === null) {
+      await once(client.process, "exit", { signal: AbortSignal.timeout(5_000) });
+    }
+  }
+}
+
+/** Drive real A/B/C calls in a chosen order; resume gates never write credentials or choose token responses. */
+async function runSchedule(
+  scenario: Scenario,
+  launch: LaunchClient,
+  storage: AuthStorage,
+  provider: Provider,
+): Promise<Client | undefined> {
+  const clientA = launch("A", scenario === "overlap" ? ["selected"] : ["selected", "write"]);
+  const clientB = launch("B", ["selected"]);
+  const clientC = scenario === "stale-expiry" || scenario === "control"
+    ? launch("C", ["expiry"])
+    : undefined;
+  await waitFor(clientA, "selected");
+  await waitFor(clientB, "selected");
+  if (clientC) await waitFor(clientC, "expiry");
+  resume(clientA, "selected");
+  resume(clientB, "selected");
+  assert.equal((await finish(clientB)).loggedIn, true);
+
+  if (scenario !== "overlap") {
+    await waitFor(clientA, "write");
+    if (scenario === "long-suspension") {
+      await waitForExpiry(storage, provider);
+      assert.equal((await finish(launch("C"))).loggedIn, true);
+    } else if (scenario === "stale-expiry") {
+      resume(clientC!, "expiry");
+      assert.equal((await finish(clientC!)).loggedIn, true);
+    }
+    resume(clientA, "write");
+  }
+  assert.equal((await finish(clientA)).loggedIn, true);
+  if (scenario === "control") {
+    resume(clientC!, "expiry");
+    assert.equal((await finish(clientC!)).loggedIn, true);
+  }
+  return clientC;
+}
+
+/** Check the real HTTP history and final file, including whether C requested an exchange or wrote anything. */
+function verifySchedule(
+  build: Build,
+  scenario: Scenario,
+  storage: AuthStorage,
+  provider: Provider,
+  clientC: Client | undefined,
+): void {
+  for (const exchange of provider.state.exchanges.slice(0, 2)) {
+    assert.equal(exchange.token, "T0");
+    assert.equal(exchange.replacement, "T1");
+  }
+  let exchangesByC = 0;
+  for (const exchange of provider.state.exchanges) {
+    if (exchange.client === "C") exchangesByC++;
+  }
+  const expectedExchangesByC = scenario === "overlap" ? 0
+    : scenario === "long-suspension" || build === "main" ? 1 : 0;
+  assert.equal(provider.state.exchanges.length, 2 + expectedExchangesByC);
+  assert.equal(exchangesByC, expectedExchangesByC);
+  if (clientC) {
+    let writes = 0;
+    for (const event of clientC.events) if (event.event === "written") writes++;
+    assert.equal(writes, expectedExchangesByC);
+  }
+  const expectedStoredToken = scenario === "control" && build === "main" ? "T2" : "T1";
+  assert.equal(storage.read()?.refresh_token, expectedStoredToken);
+}
+
+/** Require two independent retries to agree, and verify that failed refreshes leave the broken file unchanged. */
+async function verifyRetries(
+  build: Build,
+  scenario: Scenario,
+  launch: LaunchClient,
+  storage: AuthStorage,
+): Promise<boolean> {
+  const beforeRetries = storage.read();
+  const firstRetry = await finish(launch("retry-1"));
+  const secondRetry = await finish(launch("retry-2"));
+  const broken = scenario === "long-suspension" || (scenario === "stale-expiry" && build === "main");
+  for (const result of [firstRetry, secondRetry]) {
+    assert.deepEqual(result, broken
+      ? { loggedIn: false, reason: "token-expired-non-interactive" }
+      : { loggedIn: true });
+  }
+  if (broken) assert.deepEqual(storage.read(), beforeRetries);
+  return broken;
 }
 
 /**
- * Replay C's lookup, optionally apply A's delayed T1 save, then force a later
- * refresh without waiting for expiry. Main consumes T1 unnecessarily, making
- * A's overwrite stale; the PR leaves T1 usable. A/B scheduling and elapsed time
- * are modeled, while both lookups execute the package's actual auth code.
- * Omitting A's save supplies the matching control with fresh mock state.
+ * Exercise real A/B/C refreshes, real shared-file writes, and two later fresh-process retries.
+ * Checkpoints control scheduling only: snapshots and token responses always come from real reads
+ * and exchanges. The long-suspension case deliberately tests a boundary the PR does not serialize.
  */
-async function replay(bundle: AuthBundle, lateWrite: boolean): Promise<ReplayResult> {
-  const { storage, state } = createMockStorage();
-  const provider = createMockProvider();
-  const flow = createFlow(bundle, storage, provider.fetch);
-  const firstAccessToken = await flow.getOAuthTokenFromLocalState();
-  assert.equal(firstAccessToken, state.credentials.oauth_token);
+async function runScenario(build: Build, scenario: Scenario, root: string): Promise<void> {
+  const directory = mkdtempSync(join(root, `${build}-${scenario}-`));
+  const bundle = loadWrangler(build);
 
-  const firstExchanges = [...provider.exchanges];
-  const firstWrites = state.writes;
-  if (lateWrite) state.credentials = { ...SIBLING_CREDENTIALS };
-  state.credentials.expiration_time = EXPIRED_TIME;
-  const laterAccessToken = await flow.getOAuthTokenFromLocalState();
-  return { firstExchanges, firstWrites, laterAccessToken, exchanges: provider.exchanges };
+  /** Resolve the single private auth file shared by every child in this scenario. */
+  function credentialPath(): string {
+    return join(directory, "config", "default.toml");
+  }
+
+  const storage = bundle.createFileStorage("toml", credentialPath);
+  storage.write({
+    oauth_token: "access-T0",
+    refresh_token: "T0",
+    expiration_time: "2000-01-01T00:00:00.000Z",
+    scopes: ["account:read"],
+  });
+  const provider = await startProvider();
+  const clients: Client[] = [];
+
+  /** Give each process the same build, provider, and credential directory, but separate scheduling gates. */
+  function launch(id: string, pauses: Pause[] = []): Client {
+    return startClient({ build, directory, origin: provider.origin, id, pauses }, clients);
+  }
+
+  try {
+    const clientC = await runSchedule(scenario, launch, storage, provider);
+    verifySchedule(build, scenario, storage, provider, clientC);
+    await waitForExpiry(storage, provider);
+    const broken = await verifyRetries(build, scenario, launch, storage);
+    assert.ifError(provider.state.error);
+    console.log(`  ${scenario}: ${broken ? "both later retries FAIL (invalid_grant)" : "both later retries succeed"}`);
+    for (const exchange of provider.state.exchanges) {
+      console.log(`    ${exchange.client}: ${exchange.token} -> ${exchange.replacement ?? "invalid_grant"}`);
+    }
+  } finally {
+    await stopClients(clients);
+    provider.server.closeAllConnections();
+    provider.server.close();
+  }
 }
 
-/**
- * Require main to reproduce the stale-token failure and the PR to avoid it.
- * Also verify that C makes neither a refresh request nor a storage write on the
- * PR. Main's expected auth failure is a successful reproduction, not a test error.
- */
-function verifyRace(version: Build, result: ReplayResult): void {
-  const isMain = version === "main";
-  assert.deepEqual(result.firstExchanges, isMain ? ["T1 -> T2"] : []);
-  assert.equal(result.firstWrites, isMain ? 1 : 0);
-  assert.deepEqual(result.exchanges, isMain
-    ? ["T1 -> T2", "T1 -> invalid_grant"]
-    : ["T1 -> T2"]);
-  assert.equal(result.laterAccessToken, isMain ? undefined : "access-T2");
-}
-
-/** Ensure both builds refresh successfully when A's stale overwrite is absent. */
-function verifyControl(version: Build, control: ReplayResult): void {
-  const isMain = version === "main";
-  assert.deepEqual(control.exchanges, isMain
-    ? ["T1 -> T2", "T2 -> T3"]
-    : ["T1 -> T2"]);
-  assert.equal(control.laterAccessToken, isMain ? "access-T3" : "access-T2");
-}
-
-/** Explain the build's race and control outcomes after all assertions pass. */
-function printOutcome(version: Build): void {
-  const isMain = version === "main";
-  console.log(`\n${isMain ? "main" : "PR #16874"}:`);
-  console.log("  C sees expired T0; B saves valid credentials with T1 before C rereads.");
-  console.log(isMain
-    ? "  C unnecessarily refreshes T1 -> T2 and writes T2."
-    : "  C reuses B's access token: zero refresh requests, zero writes.");
-  console.log("  A's delayed response writes T1; access token expires (simulated).");
-  console.log(isMain
-    ? "  Later refresh: T1 -> invalid_grant. BUG REPRODUCED."
-    : "  Later refresh: T1 -> T2. FIX VERIFIED for this sequence.");
-
-  console.log("  Control without A's late write: refresh succeeds.");
-}
-
-/** Validate the optional build argument, defaulting to a comparison of both. */
+/** Validate the optional build selection without assuming that the two builds have identical outcomes. */
 function getBuilds(): Build[] {
   const selected = process.argv[2];
   if (!selected) return ["main", "pr"];
@@ -248,21 +266,25 @@ function getBuilds(): Build[] {
   return [selected];
 }
 
-/** Run the race and its control against one installed build, then report it. */
-async function compareBuild(version: Build): Promise<void> {
-  const bundle = loadAuth(`wrangler-${version}`);
-  verifyRace(version, await replay(bundle, true));
-  verifyControl(version, await replay(bundle, false));
-  printOutcome(version);
-}
-
-/** Configure isolation and run each selected comparison, failing on any mismatch. */
+/** Run every schedule in a disposable directory and report the PR's observed limits as well as its fix. */
 async function main(): Promise<void> {
-  configureEnvironment();
-  for (const version of getBuilds()) {
-    await compareBuild(version);
+  const root = mkdtempSync(join(tmpdir(), "wrangler-15089-"));
+  configureEnvironment(root);
+  try {
+    for (const build of getBuilds()) {
+      console.log(`\n${build === "main" ? "main" : "PR #16874"}:`);
+      for (const scenario of ["overlap", "stale-expiry", "control", "long-suspension"] as const) {
+        await runScenario(build, scenario, root);
+      }
+    }
+    console.log("\nAll scheduled outcomes verified. See README for the provider model and scope limits.");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
-  console.log("\nAll expected outcomes verified.");
 }
 
-await main();
+if (process.argv[2] === "--client") {
+  await runAuthClient(JSON.parse(process.env.REPRO_CLIENT!));
+} else {
+  await main();
+}
